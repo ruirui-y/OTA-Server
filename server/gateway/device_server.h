@@ -7,7 +7,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,8 +25,25 @@ namespace ota::gateway
 
 namespace net = nebula::net;
 
+struct DeviceSession;
+struct GatewayLoopState;
+
+// 超时环形分桶里的一格。
+//
+// 桶里挂的是「侵入式双向链表」：节点就是 DeviceSession 自己，不是单独的链表节点。
+// 好处是挂进桶、从桶里摘下来都只是改几个指针，**不分配、不释放内存**。
+// 心跳每秒上万次，用 std::list 的话就是每秒上万次 malloc/free。
+struct SessionBucket
+{
+    DeviceSession* head{nullptr};
+    DeviceSession* tail{nullptr};
+};
+
 // 一条设备连接的会话状态。
 // 连接回调、消息回调、清扫都在它所属的 IO loop 线程里处理，所以这份状态不需要锁。
+//
+// 所有权在 GatewayLoopState::sessions 的 shared_ptr 上；桶里只放裸指针。
+// 对象被销毁时析构函数自动把自己从桶里摘掉，不用手工调 Detach。
 struct DeviceSession
 {
     net::TcpConnectionPtr conn;
@@ -36,10 +52,12 @@ struct DeviceSession
     std::string fw_version;                                                 // 设备上报的当前固件版本
     bool authenticated{false};                                              // 有没有通过 Hello 认证
 
-    // 超时分桶用的两个字段。in_wheel 为 false 表示现在没挂在任何桶里。
-    std::size_t wheel_bucket{0};                                            // 挂在第几格
-    std::list<DeviceSession*>::iterator wheel_pos;                          // 在这一格链表里的位置
-    bool in_wheel{false};
+    // 侵入式链表节点：挂在哪个桶里、前后是谁。
+    SessionBucket* bucket{nullptr};                                         // nullptr 表示没挂在任何桶里
+    DeviceSession* wheel_prev{nullptr};
+    DeviceSession* wheel_next{nullptr};
+
+    ~DeviceSession();
 };
 
 // 每个 IO loop 一份，存在 EventLoop 的 context 里。
@@ -53,8 +71,8 @@ struct DeviceSession
 //   这里不需要取消语义 —— 重新挂就是取消，所以不用通用定时器那套 slot / generation。
 struct GatewayLoopState
 {
-    std::unordered_map<const net::TcpConnection*, DeviceSession> sessions;
-    std::vector<std::list<DeviceSession*>> wheel;
+    std::unordered_map<const net::TcpConnection*, std::shared_ptr<DeviceSession>> sessions;
+    std::vector<SessionBucket> wheel;
     std::size_t cursor{0};                                                  // 当前正在处理第几格
 };
 
@@ -91,9 +109,9 @@ private:
 
     void Send(const net::TcpConnectionPtr& conn, ota::control::Message& message);
 
-    // 超时分桶：挂进最新的桶 / 从当前桶摘下 / 每秒推进一格并踢掉到期连接。
+    // 超时分桶：挂进最新的桶、每秒推进一格并踢掉到期连接。
+    // 从桶里摘下来由上层的 DetachSession 和 DeviceSession 析构函数负责。
     void AttachSession(GatewayLoopState* state, DeviceSession& session);
-    void DetachSession(GatewayLoopState* state, DeviceSession& session);
     void ScheduleTick(net::EventLoop* loop);
     void TickInLoop(net::EventLoop* loop);
 

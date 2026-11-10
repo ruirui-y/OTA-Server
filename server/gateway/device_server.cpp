@@ -7,7 +7,6 @@
 #include "nebula/net/tcp_server.h"
 
 #include <chrono>
-#include <iterator>
 #include <string_view>
 #include <utility>
 
@@ -39,7 +38,66 @@ std::string EncodeFrame(const google::protobuf::MessageLite& message)
     return output;
 }
 
+// 把会话从它当前所在的桶里摘下来。没挂桶就什么都不做。
+void UnlinkSession(DeviceSession& session)
+{
+    SessionBucket* bucket = session.bucket;
+    if (bucket == nullptr)
+    {
+        return;
+    }
+
+    if (session.wheel_prev != nullptr)
+    {
+        session.wheel_prev->wheel_next = session.wheel_next;
+    }
+    else
+    {
+        bucket->head = session.wheel_next;
+    }
+
+    if (session.wheel_next != nullptr)
+    {
+        session.wheel_next->wheel_prev = session.wheel_prev;
+    }
+    else
+    {
+        bucket->tail = session.wheel_prev;
+    }
+
+    session.wheel_prev = nullptr;
+    session.wheel_next = nullptr;
+    session.bucket = nullptr;
+}
+
+// 把会话挂到桶尾。挂之前先摘，保证它只会出现在一个桶里。
+void LinkSession(SessionBucket& bucket, DeviceSession& session)
+{
+    UnlinkSession(session);
+
+    session.wheel_prev = bucket.tail;
+    session.wheel_next = nullptr;
+
+    if (bucket.tail != nullptr)
+    {
+        bucket.tail->wheel_next = &session;
+    }
+    else
+    {
+        bucket.head = &session;
+    }
+
+    bucket.tail = &session;
+    session.bucket = &bucket;
+}
+
 }  // namespace
+
+// 会话被销毁时自动从桶里摘掉。这样断开连接、踢超时都不用再记着调一次 Detach。
+DeviceSession::~DeviceSession()
+{
+    UnlinkSession(*this);
+}
 
 DeviceServer::DeviceServer(net::EventLoop* acceptor_loop, const std::string& ip, std::uint16_t port,
                            std::uint32_t heartbeat_seconds, std::uint32_t timeout_seconds)
@@ -95,7 +153,7 @@ void DeviceServer::Start(std::size_t io_thread_count)
               thread_count, heartbeat_seconds_, timeout_seconds_, timeout_seconds_);
 }
 
-// 连接建立就建会话、挂进超时分桶；断开就摘下来再删。
+// 连接建立就建会话、挂进超时分桶；断开就把会话从表里删掉，析构会自动摘桶。
 void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
 {
     GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
@@ -106,12 +164,11 @@ void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
 
     if (conn->Connected())
     {
-        DeviceSession session;
-        session.conn = conn;
-        session.wheel_bucket = 0;
+        auto session = std::make_shared<DeviceSession>();
+        session->conn = conn;
 
-        const auto inserted = state->sessions.emplace(conn.get(), std::move(session));
-        AttachSession(state, inserted.first->second);
+        state->sessions.emplace(conn.get(), session);
+        AttachSession(state, *session);
 
         connection_count_.fetch_add(1);
         return;
@@ -123,15 +180,14 @@ void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
         return;
     }
 
-    DetachSession(state, it->second);
-
-    if (it->second.authenticated)
+    if (it->second->authenticated)
     {
         online_count_.fetch_sub(1);
     }
 
-    NLOG_DEBUG("设备断开, sn={}", DisplaySn(it->second));
+    NLOG_DEBUG("设备断开, sn={}", DisplaySn(*it->second));
 
+    // erase 之后 shared_ptr 归零，DeviceSession 析构会自己从桶里摘掉。
     state->sessions.erase(it);
     connection_count_.fetch_sub(1);
 }
@@ -175,7 +231,7 @@ void DeviceServer::OnMessage(const net::TcpConnectionPtr& conn, net::Buffer* buf
         {
             HandleMessage(conn, state, message);
 
-            // 收到任何消息都算活着：把它从旧桶摘下来，挂到最新的桶。
+            // 收到任何消息都算活着：把它从旧桶摘下来、挂到最新的桶。
             // 这里不需要「取消定时器」，重新挂本身就是取消。
             if (DeviceSession* session = FindSession(state, conn.get()); session != nullptr)
             {
@@ -283,7 +339,8 @@ void DeviceServer::HandleHeartbeat(const net::TcpConnectionPtr& conn, GatewayLoo
     Send(conn, reply);
 }
 
-// 把会话挂到「现在 + 超时秒数」那一格。已经在某一格里的，先摘下来。
+// 把会话挂到「现在 + 超时秒数」那一格。已经在某一格里的会被先摘下来。
+// 挂和摘都只是改指针，不分配内存 —— 心跳每秒上万次也不会产生 malloc。
 void DeviceServer::AttachSession(GatewayLoopState* state, DeviceSession& session)
 {
     if (state->wheel.empty())
@@ -291,28 +348,8 @@ void DeviceServer::AttachSession(GatewayLoopState* state, DeviceSession& session
         return;
     }
 
-    DetachSession(state, session);
-
     const std::size_t bucket_index = (state->cursor + timeout_seconds_) % state->wheel.size();
-    auto& bucket = state->wheel[bucket_index];
-
-    bucket.push_back(&session);
-
-    session.wheel_bucket = bucket_index;
-    session.wheel_pos = std::prev(bucket.end());
-    session.in_wheel = true;
-}
-
-// 从当前桶里摘下来。取消超时就是这一句，不需要通用定时器那套。
-void DeviceServer::DetachSession(GatewayLoopState* state, DeviceSession& session)
-{
-    if (!session.in_wheel || state->wheel.empty())
-    {
-        return;
-    }
-
-    state->wheel[session.wheel_bucket].erase(session.wheel_pos);
-    session.in_wheel = false;
+    LinkSession(state->wheel[bucket_index], session);
 }
 
 // 每秒钟推进一格。
@@ -329,6 +366,9 @@ void DeviceServer::ScheduleTick(net::EventLoop* loop)
 
 // 指针挪到下一格，把这一格里的连接全踢掉。
 // 能留到这一格，说明挂进来之后整整 timeout 秒没有过任何消息。
+//
+// 这里不需要临时数组：整条链先摘下来，逐个处理，处理完一个就把指针挪到下一个，
+// 会话在这期间被销毁也没关系（它已经不在链上了，析构不会再摘一次）。
 void DeviceServer::TickInLoop(net::EventLoop* loop)
 {
     GatewayLoopState* state = loop->GetContext<GatewayLoopState>();
@@ -339,35 +379,42 @@ void DeviceServer::TickInLoop(net::EventLoop* loop)
 
     state->cursor = (state->cursor + 1) % state->wheel.size();
 
-    auto& bucket = state->wheel[state->cursor];
-    if (bucket.empty())
+    SessionBucket& bucket = state->wheel[state->cursor];
+    if (bucket.head == nullptr)
     {
         return;
     }
 
-    // 先全部摘出来再踢：ForceClose 会触发断开回调，回调里要改这张表。
-    std::vector<net::TcpConnectionPtr> expired;
-    expired.reserve(bucket.size());
+    DeviceSession* current = bucket.head;
+    bucket.head = nullptr;
+    bucket.tail = nullptr;
 
-    for (DeviceSession* session : bucket)
+    std::size_t kicked = 0;
+
+    while (current != nullptr)
     {
-        NLOG_WARN("超时踢掉连接, sn={}, 认证={}", DisplaySn(*session), session->authenticated);
+        DeviceSession* next = current->wheel_next;
+        net::TcpConnectionPtr conn = current->conn;
 
-        expired.push_back(session->conn);
-        session->in_wheel = false;
-    }
+        // 已经从链上摘下来了，清干净标记，避免析构时重复摘。
+        current->wheel_prev = nullptr;
+        current->wheel_next = nullptr;
+        current->bucket = nullptr;
 
-    bucket.clear();
+        NLOG_WARN("超时踢掉连接, sn={}, 认证={}", DisplaySn(*current), current->authenticated);
+        ++kicked;
 
-    for (const auto& conn : expired)
-    {
+        // ForceClose 会触发断开回调，回调里 erase 会话，current 可能在这里被销毁，
+        // 所以 next 必须提前取出来。
         if (conn)
         {
             conn->ForceClose();
         }
+
+        current = next;
     }
 
-    NLOG_INFO("本轮踢掉 {} 条超时连接", expired.size());
+    NLOG_INFO("本轮踢掉 {} 条超时连接", kicked);
 }
 
 // 加长度头、序列化、写出去。
@@ -386,7 +433,7 @@ void DeviceServer::Send(const net::TcpConnectionPtr& conn, ota::control::Message
 DeviceSession* DeviceServer::FindSession(GatewayLoopState* state, const net::TcpConnection* conn)
 {
     const auto it = state->sessions.find(conn);
-    return it == state->sessions.end() ? nullptr : &it->second;
+    return it == state->sessions.end() ? nullptr : it->second.get();
 }
 
 // 日志里显示用的 sn，没认证过就显示一个横杠。
