@@ -1,0 +1,50 @@
+<mxfile host="app.diagrams.net" modified="2026-11-09T00:00:00.000Z" agent="dsh" version="24.0.0">
+  <diagram name="设备上线时序" id="seq1">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="700" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="a" value="设备" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="40" width="120" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b" value="网关" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="380" y="40" width="120" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="c" value="业务服务" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="40" width="120" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="la" value="" style="endArrow=none;dashed=1;html=1;" edge="1" parent="1" source="a" target="a">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="640" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="lb" value="" style="endArrow=none;dashed=1;html=1;" edge="1" parent="1" source="b" target="b">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="440" y="640" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="lc" value="" style="endArrow=none;dashed=1;html=1;" edge="1" parent="1" source="c" target="c">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="700" y="640" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="s1" value="① TCP 连接" style="endArrow=classic;html=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="120" as="sourcePoint" /><mxPoint x="440" y="120" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="s2" value="② DeviceHello（sn / model / fw / token）" style="endArrow=classic;html=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="170" as="sourcePoint" /><mxPoint x="440" y="170" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="s3" value="③ 校验 token（查库）" style="endArrow=classic;html=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="440" y="220" as="sourcePoint" /><mxPoint x="700" y="220" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="s4" value="④ ServerHello（accepted / heartbeat_seconds）" style="endArrow=classic;html=1;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="440" y="270" as="sourcePoint" /><mxPoint x="140" y="270" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="s5" value="⑤ Heartbeat（每 30 秒）" style="endArrow=classic;html=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="330" as="sourcePoint" /><mxPoint x="440" y="330" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="s6" value="⑥ HeartbeatAck + server_time" style="endArrow=classic;html=1;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="440" y="380" as="sourcePoint" /><mxPoint x="140" y="380" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

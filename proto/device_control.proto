@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package ota.control;
+
+// 设备与网关之间的协议。
+//
+// 线上格式：
+//
+// +------------------+----------------------------------+
+// | 长度 4 字节 大端  | Message 序列化后的 N 字节         |
+// +------------------+----------------------------------+
+//
+// 长度字段表示「载荷有多少字节」，不包含它自己那 4 字节。
+
+// 设备上线时发的第一条消息，用来告诉服务端「我是谁」。
+message DeviceHello
+{
+    string sn = 1;                                                 // 设备序列号，全局唯一
+    string model = 2;                                              // 型号，决定能升哪些固件
+    string fw_version = 3;                                         // 当前固件版本
+    string token = 4;                                              // 接入凭证
+}
+
+// 服务端对 DeviceHello 的回答。
+message ServerHello
+{
+    bool accepted = 1;                                             // 认证是否通过
+    string reason = 2;                                             // 不通过时说明原因
+    uint32 heartbeat_seconds = 3;                                  // 服务端要求的心跳间隔
+}
+
+// 心跳：设备每隔一段时间报一次自己的状态。
+message Heartbeat
+{
+    uint32 cpu_percent = 1;
+    uint32 mem_percent = 2;
+    uint32 disk_percent = 3;
+    string fw_version = 4;                                         // 如实上报当前版本，服务端据此更新
+}
+
+// 心跳回执，顺带把服务端时间带给设备，方便对时。
+message HeartbeatAck
+{
+    int64 server_time_ms = 1;
+}
+
+// 服务端下发的远程指令。
+message Command
+{
+    string command_id = 1;                                         // 幂等键：同一 id 重复下发，设备只执行一次
+    string type = 2;                                               // reboot / clear_cache / set_config / pull_log
+    string payload = 3;                                            // 指令参数，JSON
+}
+
+// 设备执行完指令后回执。
+message CommandAck
+{
+    string command_id = 1;
+    bool success = 2;
+    string message = 3;
+}
+
+// 升级通知：服务端告诉设备「去这个地址下载这个版本」。
+// 固件本身不经过业务服务器，设备直接去对象存储下载。
+message UpgradeNotice
+{
+    string task_id = 1;
+    string version = 2;
+    string url = 3;
+    string sha256 = 4;
+    uint64 size = 5;
+}
+
+// 设备上报升级进度。
+message UpgradeProgress
+{
+    string task_id = 1;
+    string status = 2;                                             // downloading / verifying / installing / success / failed
+    uint32 percent = 3;
+    string error = 4;
+}
+
+// 所有消息都包在 Message 里，靠 oneof 区分类型。
+message Message
+{
+    oneof body
+    {
+        DeviceHello device_hello = 1;
+        ServerHello server_hello = 2;
+        Heartbeat heartbeat = 3;
+        HeartbeatAck heartbeat_ack = 4;
+        Command command = 5;
+        CommandAck command_ack = 6;
+        UpgradeNotice upgrade_notice = 7;
+        UpgradeProgress upgrade_progress = 8;
+    }
+}
