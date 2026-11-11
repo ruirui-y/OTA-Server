@@ -96,14 +96,15 @@ void SendFrame(const net::TcpConnectionPtr& conn, google::protobuf::MessageLite&
 
 // 一个线程只挂一个定时器，到点把自己名下的设备全发一遍心跳。
 // 每台设备单独挂定时器的话，5 万连接就是 5 万个 timer，光建和销毁就把 CPU 吃光。
-void ScheduleHeartbeat(net::EventLoop* loop, Worker* worker, std::uint32_t seconds)
+void ScheduleHeartbeat(net::EventLoop* loop, Worker* worker, std::uint32_t interval_ms)
 {
-    const std::uint32_t interval = seconds == 0 ? 30 : seconds;
+    const std::uint32_t interval = interval_ms == 0 ? 30000 : interval_ms;
 
     loop->RunAfter(
-        std::chrono::milliseconds(static_cast<std::int64_t>(interval) * 1000),
+        std::chrono::milliseconds(interval),
         [loop, worker, interval]
         {
+            const auto tick_started = std::chrono::steady_clock::now();
             int sent = 0;
 
             for (const auto& device : worker->devices)
@@ -131,6 +132,17 @@ void ScheduleHeartbeat(net::EventLoop* loop, Worker* worker, std::uint32_t secon
                 {
                     NLOG_INFO("累计发出心跳 {} 次", total);
                 }
+            }
+
+            // 这一轮发送占了多少时间。它大于 interval 就说明发送本身成了瓶颈，
+            // 因为下一次 RunAfter 是这个回调跑完才开始计时的。
+            const auto spent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - tick_started)
+                                      .count();
+
+            if (spent_ms > static_cast<std::int64_t>(interval))
+            {
+                NLOG_WARN("本轮心跳 sent={} 耗时={}ms，超过间隔 {}ms", sent, spent_ms, interval);
             }
 
             ScheduleHeartbeat(loop, worker, interval);
@@ -185,11 +197,11 @@ void HandleIncoming(const net::TcpConnectionPtr& conn, net::Buffer* buffer, cons
 // 在某个 worker 上分批创建它负责的那批客户端。
 // 一次建太多会把「创建」和「连接」串成一条长链：前面几万条已经连上了，
 // 客户端循环还没开始跑，Hello 一条都发不出去。
-void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, int from, int to, std::uint32_t interval_seconds)
+void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, int from, int to, std::uint32_t interval_ms)
 {
     auto step = std::make_shared<std::function<void()>>();
 
-    *step = [worker, host, port, from, to, interval_seconds, step]
+    *step = [worker, host, port, from, to, interval_ms, step]
     {
         const int begin = from + static_cast<int>(worker->clients.size());
         const int end = std::min(begin + kBatchSize, to);
@@ -255,9 +267,9 @@ void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, in
     worker->loop->RunInLoop([step] { (*step)(); });
 
     // 这个线程只挂一个心跳定时器，到点把它名下的设备全发一遍。
-    worker->loop->RunInLoop([worker, interval_seconds]
+    worker->loop->RunInLoop([worker, interval_ms]
         {
-            ScheduleHeartbeat(worker->loop, worker, interval_seconds);
+            ScheduleHeartbeat(worker->loop, worker, interval_ms);
         });
 }
 
@@ -269,7 +281,7 @@ int main(int argc, char** argv)
     std::uint16_t port = 9500;
     int count = 100;
     int thread_count = 4;
-    std::uint32_t interval_seconds = 30;
+    std::uint32_t interval_ms = 30000;
     std::uint32_t duration_seconds = 0;                                     // 0 = 一直跑
 
     for (int i = 1; i < argc; ++i)
@@ -292,7 +304,11 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--interval") == 0 && i + 1 < argc)
         {
-            interval_seconds = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+            interval_ms = static_cast<std::uint32_t>(std::atoi(argv[++i])) * 1000;
+        }
+        else if (std::strcmp(argv[i], "--interval-ms") == 0 && i + 1 < argc)
+        {
+            interval_ms = static_cast<std::uint32_t>(std::atoi(argv[++i]));
         }
         else if (std::strcmp(argv[i], "--duration") == 0 && i + 1 < argc)
         {
@@ -329,7 +345,7 @@ int main(int argc, char** argv)
         const int from = count * t / thread_count;
         const int to = count * (t + 1) / thread_count;
 
-        StartWorker(worker.get(), host, port, from, to, interval_seconds);
+        StartWorker(worker.get(), host, port, from, to, interval_ms);
 
         workers.push_back(std::move(worker));
     }
