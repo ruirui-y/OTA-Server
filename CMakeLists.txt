@@ -38,6 +38,7 @@ endif()
 if(OTA_HAS_SERVER)
     find_package(Protobuf REQUIRED)
     find_package(spdlog REQUIRED)
+    find_package(PkgConfig REQUIRED)
 
     if(TARGET protobuf::protoc)
         set(PROTOC_EXECUTABLE $<TARGET_FILE:protobuf::protoc>)

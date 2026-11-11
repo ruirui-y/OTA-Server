@@ -48,10 +48,19 @@ std::atomic<int> g_heartbeat{0};                                            // �
 struct SimDevice
 {
     std::string sn;
+    std::string token;                                                      // 接入凭证，和库里的 token_hash 对应
     std::string pending;
     net::TcpConnectionPtr conn;                                             // 连上之后才有，发心跳要用
     std::atomic<bool> hello_ok{false};
 };
+
+// 造 sn / token：sim-000001 这种固定 6 位，和 scripts/seed_devices.sql 对得上。
+std::string MakeName(const char* prefix, int index)
+{
+    char buffer[32] = {};
+    std::snprintf(buffer, sizeof(buffer), "%s%06d", prefix, index);
+    return std::string(buffer);
+}
 
 // 一个压测线程：自己的 EventLoop + 自己那批客户端。
 struct Worker
@@ -187,7 +196,8 @@ void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, in
         for (int i = begin; i < end; ++i)
         {
             auto device = std::make_shared<SimDevice>();
-            device->sn = "sim-" + std::to_string(i);
+            device->sn = MakeName("sim-", i);
+            device->token = MakeName("tok-", i);
             worker->devices.push_back(device);
 
             auto client = std::make_shared<net::TcpClient>(worker->loop, host, port);
@@ -208,7 +218,7 @@ void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, in
                     hello->set_sn(device->sn);
                     hello->set_model("SIM-200");
                     hello->set_fw_version("1.0.0");
-                    hello->set_token("demo-token");
+                    hello->set_token(device->token);
 
                     SendFrame(conn, message);
 
@@ -250,7 +260,7 @@ void StartWorker(Worker* worker, const std::string& host, std::uint16_t port, in
         });
 }
 
-}  // namespace
+} // namespace
 
 int main(int argc, char** argv)
 {

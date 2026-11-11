@@ -2,6 +2,7 @@
 
 #include "nebula/base/logger.h"
 #include "nebula/net/buffer.h"
+#include "nebula/net/channel.h"
 #include "nebula/net/event_loop.h"
 #include "nebula/net/tcp_connection.h"
 #include "nebula/net/tcp_server.h"
@@ -13,12 +14,14 @@
 namespace ota::gateway
 {
 
+using net::TcpConnectionPtr;                                                                    // 下面参数统一写 TcpConnectionPtr
+
 namespace
 {
 
-constexpr std::size_t kLengthFieldBytes = 4;                                // 帧头：4 字节大端长度
-constexpr std::uint32_t kMaxFrameBytes = 64U * 1024U;                       // 心跳和 Hello 都很小，64KB 足够
-constexpr std::uint32_t kTickMillis = 1000;                                 // 分桶每秒推进一格
+constexpr std::size_t kLengthFieldBytes = 4;                                                    // 帧头：4 字节大端长度
+constexpr std::uint32_t kMaxFrameBytes = 64U * 1024U;                                           // 心跳和 Hello 都很小，64KB 足够
+constexpr std::uint32_t kTickMillis = 1000;                                                     // 分桶每秒推进一格
 
 // 把一条 protobuf 消息拼上 4 字节大端长度。
 std::string EncodeFrame(const google::protobuf::MessageLite& message)
@@ -91,71 +94,55 @@ void LinkSession(SessionBucket& bucket, DeviceSession& session)
     session.bucket = &bucket;
 }
 
-}  // namespace
+} // namespace
 
-// 会话被销毁时自动从桶里摘掉。这样断开连接、踢超时都不用再记着调一次 Detach。
 DeviceSession::~DeviceSession()
 {
     UnlinkSession(*this);
 }
 
-DeviceServer::DeviceServer(net::EventLoop* acceptor_loop, const std::string& ip, std::uint16_t port,
-                           std::uint32_t heartbeat_seconds, std::uint32_t timeout_seconds)
-    : server_(std::make_unique<net::TcpServer>(acceptor_loop, ip, port))
+DeviceServer::DeviceServer(storage::DbConfig db_config,
+                           std::uint32_t heartbeat_seconds,
+                           std::uint32_t timeout_seconds,
+                           std::uint32_t refresh_seconds)
+    : db_config_(std::move(db_config))
     , heartbeat_seconds_(heartbeat_seconds == 0 ? 30 : heartbeat_seconds)
     , timeout_seconds_(timeout_seconds == 0 ? 3 * heartbeat_seconds_ : timeout_seconds)
+    , refresh_seconds_(refresh_seconds == 0 ? 60 : refresh_seconds)
 {
-    server_->SetConnectionCallback(
-        [this](const net::TcpConnectionPtr& conn)
-        {
-            OnConnection(conn);
-        });
-
-    server_->SetMessageCallback(
-        [this](const net::TcpConnectionPtr& conn, net::Buffer* buffer)
-        {
-            OnMessage(conn, buffer);
-        });
-
-    // 单条连接最多攒 1MB 待发，超了就断，防止卡死的设备把网关拖垮。
-    server_->SetMaxOutputBufferBytes(1U * 1024U * 1024U);
 }
 
 DeviceServer::~DeviceServer() = default;
 
-// 启动监听。每个 IO loop 起来时给自己建一份会话表和一个环形分桶，再挂上每秒推进的定时器。
-void DeviceServer::Start(std::size_t io_thread_count)
+// 给这个 loop 建好它独享的状态：会话表、环形分桶、四条数据库连接、设备缓存。
+void DeviceServer::InitializeLoop(net::EventLoop* loop)
 {
-    const std::size_t thread_count = io_thread_count == 0 ? 1 : io_thread_count;
+    loop->AssertInLoopThread();
 
-    server_->SetIoLoopInitCallback(
-        [this](net::EventLoop* loop)
-        {
-            auto state = std::make_unique<GatewayLoopState>();
+    auto state = std::make_unique<GatewayLoopState>();
 
-            // 一格一秒，桶数等于超时秒数：挂进「cursor + 超时」那一格，
-            // 等 cursor 转到它正好过了 timeout_seconds_ 秒。
-            state->wheel.resize(timeout_seconds_);
+    // 一格一秒，桶数等于超时秒数：挂进「cursor + 超时」那一格，
+    // 等 cursor 转到它正好过了 timeout_seconds_ 秒。
+    state->wheel.resize(timeout_seconds_);
 
-            loop->SetContext(std::move(state));
+    // 四条按 SQL 类型分开的 Pipeline 连接，由这个 loop 独占。
+    state->executor = std::make_unique<storage::DbExecutor>(loop, db_config_);
+    state->repository = std::make_unique<storage::DeviceRepository>(state->executor.get());
 
-            {
-                std::lock_guard<std::mutex> lock(loops_mutex_);
-                io_loops_.push_back(loop);
-            }
+    loop->SetContext(std::move(state));
 
-            ScheduleTick(loop);
-        });
+    ScheduleTick(loop);
+    ScheduleRefresh(loop);
 
-    server_->Start(thread_count);
-
-    NLOG_INFO("网关已启动, IO 线程数={}, 心跳间隔={}s, 超时={}s, 分桶数={}",
-              thread_count, heartbeat_seconds_, timeout_seconds_, timeout_seconds_);
+    NLOG_INFO("IO 线程已初始化, 心跳={}s, 超时={}s, 刷库={}s, 分桶={}",
+              heartbeat_seconds_, timeout_seconds_, refresh_seconds_, timeout_seconds_);
 }
 
 // 连接建立就建会话、挂进超时分桶；断开就把会话从表里删掉，析构会自动摘桶。
-void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
+void DeviceServer::OnConnection(const TcpConnectionPtr& conn)
 {
+    conn->Loop()->AssertInLoopThread();
+
     GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
     if (state == nullptr)
     {
@@ -180,7 +167,7 @@ void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
         return;
     }
 
-    if (it->second->authenticated)
+    if (it->second->Authenticated())
     {
         online_count_.fetch_sub(1);
     }
@@ -199,8 +186,10 @@ void DeviceServer::OnConnection(const net::TcpConnectionPtr& conn)
 // +------------------+----------------------------------+
 //
 // while 处理粘包，return 处理半包。
-void DeviceServer::OnMessage(const net::TcpConnectionPtr& conn, net::Buffer* buffer)
+void DeviceServer::OnMessage(const TcpConnectionPtr& conn, net::Buffer* buffer)
 {
+    conn->Loop()->AssertInLoopThread();
+
     GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
     if (state == nullptr)
     {
@@ -236,6 +225,13 @@ void DeviceServer::OnMessage(const net::TcpConnectionPtr& conn, net::Buffer* buf
             if (DeviceSession* session = FindSession(state, conn.get()); session != nullptr)
             {
                 AttachSession(state, *session);
+
+                // 认证通过的设备顺手记进「这一轮要刷 last_seen」。
+                // 心跳会重复命中同一个 sn，所以用 set。
+                if (session->Authenticated() && !session->sn.empty())
+                {
+                    state->pending_last_seen.insert(session->sn);
+                }
             }
         }
         else
@@ -248,7 +244,7 @@ void DeviceServer::OnMessage(const net::TcpConnectionPtr& conn, net::Buffer* buf
 }
 
 // 按 oneof 里实际带的类型分发，不写业务逻辑。
-void DeviceServer::HandleMessage(const net::TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::Message& message)
+void DeviceServer::HandleMessage(const TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::Message& message)
 {
     switch (message.body_case())
     {
@@ -277,8 +273,11 @@ void DeviceServer::HandleMessage(const net::TcpConnectionPtr& conn, GatewayLoopS
     }
 }
 
-// 设备第一次上来时自报身份。骨架阶段只校验 token 非空，正式版要查库。
-void DeviceServer::HandleHello(const net::TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::DeviceHello& hello)
+// 设备第一次上来时自报身份。
+//
+// 先查内存缓存：命中就立刻回，不碰数据库。
+// 未命中才发起异步查询，这期间连接挂起（不是线程挂起），结果回来再回包。
+void DeviceServer::HandleHello(const TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::DeviceHello& hello)
 {
     DeviceSession* session = FindSession(state, conn.get());
     if (session == nullptr)
@@ -286,38 +285,142 @@ void DeviceServer::HandleHello(const net::TcpConnectionPtr& conn, GatewayLoopSta
         return;
     }
 
-    ota::control::Message reply;
-    ota::control::ServerHello* server_hello = reply.mutable_server_hello();
-    server_hello->set_heartbeat_seconds(heartbeat_seconds_);
+    if (session->Authenticated())
+    {
+        NLOG_DEBUG("重复 Hello 被忽略, sn={}", session->sn);
+        return;
+    }
+
+    if (session->auth == DeviceSession::AuthState::kAuthenticating)
+    {
+        NLOG_DEBUG("上一条认证还没回来，忽略重复 Hello, 连接={}", conn->Name());
+        return;
+    }
 
     if (hello.sn().empty() || hello.token().empty())
     {
-        server_hello->set_accepted(false);
-        server_hello->set_reason("sn 或 token 为空");
-
-        NLOG_WARN("Hello 被拒绝, 连接={}", conn->Name());
-        Send(conn, reply);
-
-        conn->ForceClose();
+        RejectConnection(conn, "sn 或 token 为空");
         return;
     }
 
     session->sn = hello.sn();
     session->model = hello.model();
     session->fw_version = hello.fw_version();
-    session->authenticated = true;
+    session->auth = DeviceSession::AuthState::kAuthenticating;
+
+    // 1. 先看缓存。设备重连时绝大多数会命中，这条路径完全不碰数据库。
+    CachedDevice cached;
+    if (state->cache.Lookup(session->sn, &cached))
+    {
+        storage::AuthResult auth;
+        auth.ok = true;
+        auth.record.model = cached.model;
+        auth.record.group_name = cached.group_name;
+        auth.record.fw_version = cached.fw_version;
+
+        CompleteAuthentication(conn, auth);
+        return;
+    }
+
+    // 2. 缓存未命中，查库。库不可用就直接拒绝（安全优先，宁可连不上也不放行）。
+    if (!state->executor->Connected(storage::QueryKind::kRead))
+    {
+        NLOG_WARN("数据库不可用，拒绝新设备认证, sn={}", session->sn);
+        RejectConnection(conn, "服务端数据库不可用");
+        return;
+    }
+
+    // 3. 起协程查库：DetachedTask 创建即开始执行，跑到 co_await 才挂起。
+    HandleHelloAsync(conn, session->sn, hello.token());
+}
+
+// 认证的异步部分。整条流程是一条直线，没有嵌套回调。
+coro::DetachedTask DeviceServer::HandleHelloAsync(net::TcpConnectionPtr conn, std::string sn, std::string token)
+{
+    GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
+    if (state == nullptr)
+    {
+        co_return;
+    }
+
+    const storage::QueryResult result = co_await state->repository->AuthenticateQuery(sn, token);
+
+    // 挂起期间连接可能已经断了：ForceClose 之后这里的 Connected() 是 false。
+    if (!conn->Connected())
+    {
+        NLOG_DEBUG("认证结果回来时连接已经断了");
+        co_return;
+    }
+
+    CompleteAuthentication(conn, storage::DeviceRepository::ParseAuth(result, sn));
+}
+
+// 认证结果落地：通过就写缓存、回 ServerHello、算在线；不通过就回原因并断开。
+void DeviceServer::CompleteAuthentication(const TcpConnectionPtr& conn, const storage::AuthResult& auth)
+{
+    GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
+    if (state == nullptr)
+    {
+        return;
+    }
+
+    DeviceSession* session = FindSession(state, conn.get());
+    if (session == nullptr)
+    {
+        return;
+    }
+
+    if (!auth.ok)
+    {
+        auth_failed_count_.fetch_add(1);
+
+        // error 非空说明是库的问题，空说明设备不存在或 token 不对。
+        RejectConnection(conn, auth.error.empty() ? "认证失败" : "服务端数据库异常");
+        return;
+    }
+
+    session->model = auth.record.model.empty() ? session->model : auth.record.model;
+    session->fw_version = auth.record.fw_version.empty() ? session->fw_version : auth.record.fw_version;
+    session->auth = DeviceSession::AuthState::kAuthenticated;
+
+    // 认证通过的东西放进缓存，下次重连直接命中。
+    state->cache.Put(session->sn, auth.record.model, auth.record.group_name, auth.record.fw_version);
 
     online_count_.fetch_add(1);
 
+    ota::control::Message reply;
+    ota::control::ServerHello* server_hello = reply.mutable_server_hello();
     server_hello->set_accepted(true);
+    server_hello->set_heartbeat_seconds(heartbeat_seconds_);
     Send(conn, reply);
 
-    NLOG_DEBUG("设备上线, sn={}, model={}, fw={}", session->sn, session->model, session->fw_version);
+    NLOG_DEBUG("设备上线, sn={}, model={}, fw={}, 在线={}",
+               session->sn, session->model, session->fw_version, online_count_.load());
+}
+
+// 拒绝一条连接：先回一个 accepted=false 的 ServerHello 说明原因，再断开。
+void DeviceServer::RejectConnection(const TcpConnectionPtr& conn, const std::string& reason)
+{
+    if (GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>(); state != nullptr)
+    {
+        if (DeviceSession* session = FindSession(state, conn.get()); session != nullptr)
+        {
+            session->auth = DeviceSession::AuthState::kRejected;
+        }
+    }
+
+    ota::control::Message reply;
+    ota::control::ServerHello* server_hello = reply.mutable_server_hello();
+    server_hello->set_accepted(false);
+    server_hello->set_reason(reason);
+    Send(conn, reply);
+
+    conn->ForceClose();
 }
 
 // 心跳本身不改状态，会话的活跃时间由「重新挂桶」隐式记录。
 // 这里只顺手跟上报的固件版本对齐，并把服务端时间带回去。
-void DeviceServer::HandleHeartbeat(const net::TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::Heartbeat& heartbeat)
+void DeviceServer::HandleHeartbeat(const TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::Heartbeat& heartbeat)
 {
     DeviceSession* session = FindSession(state, conn.get());
     if (session == nullptr)
@@ -325,9 +428,21 @@ void DeviceServer::HandleHeartbeat(const net::TcpConnectionPtr& conn, GatewayLoo
         return;
     }
 
-    if (!heartbeat.fw_version().empty())
+    // 没认证的连接发心跳一律不理，免得绕过 Hello。
+    if (!session->Authenticated())
+    {
+        NLOG_DEBUG("未认证的连接发心跳，忽略, 连接={}", conn->Name());
+        return;
+    }
+
+    if (!heartbeat.fw_version().empty() && heartbeat.fw_version() != session->fw_version)
     {
         session->fw_version = heartbeat.fw_version();
+
+        // 设备自己报的版本变了（比如上次升级完成随后重启），缓存和库都跟一下。
+        state->cache.UpdateVersion(session->sn, session->fw_version);
+
+        SyncVersionAsync(state, session->sn, session->fw_version);
     }
 
     ota::control::Message reply;
@@ -371,6 +486,8 @@ void DeviceServer::ScheduleTick(net::EventLoop* loop)
 // 会话在这期间被销毁也没关系（它已经不在链上了，析构不会再摘一次）。
 void DeviceServer::TickInLoop(net::EventLoop* loop)
 {
+    loop->AssertInLoopThread();
+
     GatewayLoopState* state = loop->GetContext<GatewayLoopState>();
     if (state == nullptr || state->wheel.empty())
     {
@@ -401,7 +518,7 @@ void DeviceServer::TickInLoop(net::EventLoop* loop)
         current->wheel_next = nullptr;
         current->bucket = nullptr;
 
-        NLOG_WARN("超时踢掉连接, sn={}, 认证={}", DisplaySn(*current), current->authenticated);
+        NLOG_WARN("超时踢掉连接, sn={}, 认证={}", DisplaySn(*current), current->auth == DeviceSession::AuthState::kAuthenticated);
         ++kicked;
 
         // ForceClose 会触发断开回调，回调里 erase 会话，current 可能在这里被销毁，
@@ -415,6 +532,73 @@ void DeviceServer::TickInLoop(net::EventLoop* loop)
     }
 
     NLOG_INFO("本轮踢掉 {} 条超时连接", kicked);
+}
+
+// 每 refresh_seconds_ 秒刷一次 last_seen_at。
+void DeviceServer::ScheduleRefresh(net::EventLoop* loop)
+{
+    loop->RunAfter(
+        std::chrono::milliseconds(static_cast<std::int64_t>(refresh_seconds_) * 1000),
+        [this, loop]
+        {
+            RefreshInLoop(loop);
+            ScheduleRefresh(loop);
+        });
+}
+
+// 把这一轮收集到的 sn 交给数据库，一条 UPDATE 打完，然后清空。
+// 失败只记日志：下一轮还会刷，不影响任何连接。
+void DeviceServer::RefreshInLoop(net::EventLoop* loop)
+{
+    loop->AssertInLoopThread();
+
+    GatewayLoopState* state = loop->GetContext<GatewayLoopState>();
+    if (state == nullptr || state->pending_last_seen.empty())
+    {
+        return;
+    }
+
+    std::vector<std::string> sns;
+    sns.reserve(state->pending_last_seen.size());
+
+    for (const std::string& sn : state->pending_last_seen)
+    {
+        sns.push_back(sn);
+    }
+
+    state->pending_last_seen.clear();
+
+    if (!state->executor->Connected(storage::QueryKind::kUpdate))
+    {
+        NLOG_WARN("数据库不可用，跳过本轮 last_seen 刷新, {} 条", sns.size());
+        return;
+    }
+
+    RefreshLastSeenAsync(state, std::move(sns));
+}
+
+// 批量刷 last_seen 的异步部分。失败只影响这一轮，下一轮还会刷。
+coro::DetachedTask DeviceServer::RefreshLastSeenAsync(GatewayLoopState* state, std::vector<std::string> sns)
+{
+    if (state == nullptr || state->repository == nullptr)
+    {
+        co_return;
+    }
+
+    const storage::QueryResult result = co_await state->repository->RefreshLastSeenQuery(sns);
+    storage::DeviceRepository::ParseRefresh(result, sns.size());
+}
+
+// 同步设备版本的异步部分。设备上报的版本变了才走这里，频率很低。
+coro::DetachedTask DeviceServer::SyncVersionAsync(GatewayLoopState* state, std::string sn, std::string fw_version)
+{
+    if (state == nullptr || state->repository == nullptr)
+    {
+        co_return;
+    }
+
+    const storage::QueryResult result = co_await state->repository->UpdateVersionQuery(sn, fw_version);
+    storage::DeviceRepository::ParseUpdateVersion(result, sn);
 }
 
 // 加长度头、序列化、写出去。
@@ -454,4 +638,4 @@ std::size_t DeviceServer::ConnectionCount() const
     return connection_count_.load();
 }
 
-}  // namespace ota::gateway
+} // namespace ota::gateway
