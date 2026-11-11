@@ -45,6 +45,9 @@ public:
     [[nodiscard]] std::size_t OnlineCount() const;                         // 已认证的设备数
     [[nodiscard]] std::size_t ConnectionCount() const;                     // 当前连接数
 
+    // 打印并清空这一轮的消息处理耗时，给统计线程调用。
+    void ReportLatency();
+
 private:
     std::unique_ptr<net::TcpServer> server_;                               // 网络层，归主线程所有
     std::unique_ptr<gateway::DeviceServer> device_server_;                 // 回调处理，方法都跑在 IO 线程

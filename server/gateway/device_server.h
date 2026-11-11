@@ -128,6 +128,9 @@ public:
     [[nodiscard]] std::size_t OnlineCount() const;                                              // 已认证的设备数
     [[nodiscard]] std::size_t ConnectionCount() const;                                          // 当前连接数
 
+    // 打印并清空这一轮的消息处理耗时。跑在调用者的线程里，和 IO 线程用锁隔开。
+    void ReportLatency();
+
 private:
     // 只做类型分发，具体逻辑在各自的处理函数里。
     void HandleMessage(const net::TcpConnectionPtr& conn, GatewayLoopState* state, const ota::control::Message& message);
@@ -169,6 +172,12 @@ private:
     std::atomic<std::size_t> online_count_{0};                                                  // 已完成 Hello 的设备数
     std::atomic<std::size_t> connection_count_{0};                                              // 当前 TCP 连接数
     std::atomic<std::size_t> auth_failed_count_{0};                                             // 认证失败次数，便于观察
+
+    // 每条入站消息的处理耗时（纳秒）。IO 线程写，统计线程读，用锁隔开。
+    std::mutex latency_mutex_;
+    std::vector<std::int64_t> latency_ns_;                                                      // 到 20 万条就停，1.6MB
+    std::size_t frames_in_window_{0};                                                           // 这一轮解析了多少帧
+    std::chrono::steady_clock::time_point last_report_{std::chrono::steady_clock::now()};       // 上一轮报告的时刻，算 QPS 用
 };
 
 } // namespace ota::gateway

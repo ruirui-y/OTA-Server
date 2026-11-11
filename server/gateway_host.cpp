@@ -69,4 +69,9 @@ std::size_t GatewayHost::ConnectionCount() const
     return device_server_->ConnectionCount();
 }
 
+void GatewayHost::ReportLatency()
+{
+    device_server_->ReportLatency();
+}
+
 }  // namespace ota

@@ -65,6 +65,14 @@ QueryAwaiter DeviceRepository::AuthenticateQuery(const std::string& sn, const st
 // 发批量刷 last_seen 的语句。写连接。
 QueryAwaiter DeviceRepository::RefreshLastSeenQuery(const std::vector<std::string>& sns)
 {
+    // 只有一条 SQL，但参数很长：每个 sn 连逗号 11 个字符，5 万个约 537KB。
+    //
+    // 这个长度带来两件事：
+    //   · PQflush 大概率一次写不完，返回 1 之后要等可写事件再 flush（db_connection 里已处理）
+    //   · 服务端要 string_to_array 拆开，再做 5 万次索引查找
+    //
+    // 实测 5 万设备能跑（60 秒一次，48325 行更新成功）。到 50 万设备时这条 SQL 会到 5MB，
+    // 那时要改：按 5000 个一批拆成几条 UPDATE，或者先落到临时表再 JOIN。
     return executor_->Update(kRefreshSql, {JoinSns(sns)});
 }
 

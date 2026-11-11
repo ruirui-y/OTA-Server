@@ -7,6 +7,7 @@
 #include "nebula/net/tcp_connection.h"
 #include "nebula/net/tcp_server.h"
 
+#include <algorithm>
 #include <chrono>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,7 @@ namespace
 constexpr std::size_t kLengthFieldBytes = 4;                                                    // 帧头：4 字节大端长度
 constexpr std::uint32_t kMaxFrameBytes = 64U * 1024U;                                           // 心跳和 Hello 都很小，64KB 足够
 constexpr std::uint32_t kTickMillis = 1000;                                                     // 分桶每秒推进一格
+constexpr std::size_t kMaxLatencySamples = 200000;                                          // 延迟采样上限，1.6MB
 
 // 把一条 protobuf 消息拼上 4 字节大端长度。
 std::string EncodeFrame(const google::protobuf::MessageLite& message)
@@ -190,6 +192,10 @@ void DeviceServer::OnMessage(const TcpConnectionPtr& conn, net::Buffer* buffer)
 {
     conn->Loop()->AssertInLoopThread();
 
+    const auto received_at = std::chrono::steady_clock::now();
+
+    std::size_t frames = 0;
+
     GatewayLoopState* state = conn->Loop()->GetContext<GatewayLoopState>();
     if (state == nullptr)
     {
@@ -239,7 +245,23 @@ void DeviceServer::OnMessage(const TcpConnectionPtr& conn, net::Buffer* buffer)
             NLOG_WARN("消息解析失败, 连接={}, 载荷={} 字节", conn->Name(), body_size);
         }
 
+        ++frames;
         buffer->Retrieve(kLengthFieldBytes + static_cast<std::size_t>(body_size));
+    }
+
+    // 一条连接里可能一次来了好几帧，这里记的是「这一批字节处理完」的总耗时。
+    const auto spent_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - received_at)
+                              .count();
+
+    {
+        std::lock_guard<std::mutex> lock(latency_mutex_);
+        frames_in_window_ += frames;
+
+        if (latency_ns_.size() < kMaxLatencySamples)
+        {
+            latency_ns_.push_back(spent_ns);
+        }
     }
 }
 
@@ -636,6 +658,47 @@ std::size_t DeviceServer::OnlineCount() const
 std::size_t DeviceServer::ConnectionCount() const
 {
     return connection_count_.load();
+}
+
+// 打印这一轮的消息处理耗时，然后清空样本。
+// 单位是纳秒，输出时换成微秒，方便和网络延迟对照。
+void DeviceServer::ReportLatency()
+{
+    std::vector<std::int64_t> samples;
+    std::size_t frames = 0;
+    {
+        std::lock_guard<std::mutex> lock(latency_mutex_);
+        samples.swap(latency_ns_);
+        frames = frames_in_window_;
+        frames_in_window_ = 0;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report_).count();
+    last_report_ = now;
+
+    if (samples.empty() || seconds <= 0.0)
+    {
+        return;
+    }
+
+    std::sort(samples.begin(), samples.end());
+
+    const std::size_t used = samples.size();
+    const auto pick = [&samples, used](double ratio)
+    {
+        const std::size_t index = static_cast<std::size_t>(ratio * static_cast<double>(used - 1));
+        return samples[index] / 1000;
+    };
+
+    const double frame_qps = static_cast<double>(frames) / seconds;
+    const double call_qps = static_cast<double>(used) / seconds;
+
+    NLOG_INFO("QPS={:.0f} 帧/秒 ({} 次调用/秒) 样本={} p50={}us p90={}us p99={}us p999={}us max={}us",
+              frame_qps,
+              static_cast<std::size_t>(call_qps),
+              used,
+              pick(0.50), pick(0.90), pick(0.99), pick(0.999), samples[used - 1] / 1000);
 }
 
 } // namespace ota::gateway
