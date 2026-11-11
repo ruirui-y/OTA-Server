@@ -18,11 +18,11 @@
 
 #include "nebula/base/logger.h"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -178,6 +178,7 @@ void HandleIncoming(const net::TcpConnectionPtr& conn, net::Buffer* buffer, cons
                 NLOG_INFO("已认证 {} 个设备", ok);
             }
         }
+
     }
 }
 
@@ -269,6 +270,7 @@ int main(int argc, char** argv)
     int count = 100;
     int thread_count = 4;
     std::uint32_t interval_seconds = 30;
+    std::uint32_t duration_seconds = 0;                                     // 0 = 一直跑
 
     for (int i = 1; i < argc; ++i)
     {
@@ -291,6 +293,10 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--interval") == 0 && i + 1 < argc)
         {
             interval_seconds = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+        }
+        else if (std::strcmp(argv[i], "--duration") == 0 && i + 1 < argc)
+        {
+            duration_seconds = static_cast<std::uint32_t>(std::atoi(argv[++i]));
         }
     }
 
@@ -328,10 +334,36 @@ int main(int argc, char** argv)
         workers.push_back(std::move(worker));
     }
 
-    // 主线程什么都不干，让各 worker 自己跑。
+    // 主线程只负责定期打统计；给了 --duration 就到点打印延迟分位再退出。
+    const auto started_at = std::chrono::steady_clock::now();
+
     for (;;)
     {
         std::this_thread::sleep_for(std::chrono::seconds(10));
         NLOG_INFO("累计 创建={} 连接={} 认证={}", g_created.load(), g_connected.load(), g_hello_ok.load());
+
+        if (duration_seconds == 0)
+        {
+            continue;
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - started_at)
+                                 .count();
+
+        if (elapsed < static_cast<std::int64_t>(duration_seconds))
+        {
+            continue;
+        }
+
+        // 模拟器只负责压流量，延迟一律看服务端日志里的「处理耗时」。
+        std::printf("\n============== 压测汇总 ==============\n");
+        std::printf("  创建=%d  连接=%d  认证=%d  心跳=%d\n",
+                    g_created.load(), g_connected.load(), g_hello_ok.load(), g_heartbeat.load());
+        std::printf("======================================\n");
+        std::fflush(stdout);
+
+        // 各 worker 的 EventLoop 还在跑，直接退进程，不走析构。
+        std::_Exit(0);
     }
 }
