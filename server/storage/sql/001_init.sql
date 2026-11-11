@@ -13,6 +13,10 @@
 
 BEGIN;
 
+-- 先删再建：这个文件是「从零重建」用的，不是增量迁移。
+-- 注意：执行它会清掉现有数据。生产环境不要这么干。
+DROP TABLE IF EXISTS commands, device_upgrades, rollout_batches, rollouts, firmware, devices CASCADE;
+
 -- ---------------------------------------------------------------------------
 -- devices：设备档案
 -- 这台设备是什么、属于谁、现在跑哪个版本
@@ -21,6 +25,7 @@ CREATE TABLE devices
 (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sn              text        NOT NULL UNIQUE,
+    token_hash      text        NOT NULL DEFAULT '',
     model           text        NOT NULL,
     group_name      text        NOT NULL DEFAULT '',
     fw_version      text        NOT NULL DEFAULT '',
@@ -33,6 +38,7 @@ CREATE TABLE devices
 COMMENT ON TABLE  devices                IS '设备档案：型号、分组、当前版本。在线状态不在这里。';
 COMMENT ON COLUMN devices.id             IS '内部编号，自增。只在本库内有意义，不对设备暴露';
 COMMENT ON COLUMN devices.sn             IS '设备序列号，全局唯一。网关靠它认人，不是数据库 id';
+COMMENT ON COLUMN devices.token_hash     IS '设备接入凭证的 SHA-256（64 位小写十六进制）。只存哈希不存明文：库被拖走时明文 token 等于所有设备被接管。设备令牌是随机串，不需要慢哈希';
 COMMENT ON COLUMN devices.model          IS '硬件型号，例如 SIM-200。决定这台设备能升哪些固件';
 COMMENT ON COLUMN devices.group_name     IS '分组名，例如「华东产线」。升级批次按它圈设备';
 COMMENT ON COLUMN devices.fw_version     IS '当前固件版本，例如 1.2.3。升级成功时由服务端更新';
